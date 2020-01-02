@@ -1,24 +1,60 @@
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
+#include <utility>
 
-constexpr auto BURST_SIZE = 32;
+void reply_to_arp_request(
+  const rte_ether_addr rx_port_mac_addr,
+  rte_ether_hdr *ether_hdr,
+  rte_mbuf *packet)
+{
+  ether_hdr->d_addr = ether_hdr->s_addr;
+  ether_hdr->s_addr = rx_port_mac_addr;
+  auto arp_hdr = rte_pktmbuf_mtod_offset(
+    packet, rte_arp_hdr *, RTE_ETHER_HDR_LEN);
+  arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+  arp_hdr->arp_data.arp_tha = rx_port_mac_addr;
+}
 
-constexpr auto MBUF_CACHE_SIZE = 256;
+void reply_to_icmp_ping(
+  rte_ether_hdr *ether_hdr,
+  rte_mbuf *packet)
+{
+  std::swap(ether_hdr->s_addr, ether_hdr->d_addr);
+  auto ipv4_hdr = rte_pktmbuf_mtod_offset(
+    packet, rte_ipv4_hdr *, RTE_ETHER_HDR_LEN);
+  std::swap(
+    (rte_be32_t &)ipv4_hdr->src_addr,
+    (rte_be32_t &)ipv4_hdr->dst_addr);
+  auto icmp_hdr = rte_pktmbuf_mtod_offset(packet, rte_icmp_hdr *,
+    RTE_ETHER_HDR_LEN +
+    (ipv4_hdr->version_ihl & RTE_IPV4_HDR_IHL_MASK) * RTE_IPV4_IHL_MULTIPLIER);
+  icmp_hdr->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+}
 
-/* The optimum size (in terms of memory usage) for a mempool
- * is when n is a power of two minus one:
- * n = (2^q - 1) */
-constexpr auto NUM_BUFS = 8191;
-
-/* Forward packets between NICs */
-[[noreturn]] static void forward(void) {
+[[noreturn]] static void packet_processing_loop(rte_ether_addr *port_macs) {
   uint16_t port_id;
+  constexpr auto BURST_SIZE = 32;
   rte_mbuf *packets[BURST_SIZE];
+
   while(true) {
     RTE_ETH_FOREACH_DEV(port_id) {
+      /* read burst of packets */
       const auto nb_pkts_rx = rte_eth_rx_burst(port_id, 0, packets, BURST_SIZE);
-      /* forward received packets to paired ethernet device */
-      const auto nb_pkts_tx = rte_eth_tx_burst(port_id ^ 1, 0, packets, nb_pkts_rx);
+      for (auto i = 0; i < nb_pkts_rx; i++) {
+        /* extract information from ethernet header */
+        auto ether_hdr = rte_pktmbuf_mtod(packets[i], rte_ether_hdr *);
+        auto ether_type = rte_be_to_cpu_16(ether_hdr->ether_type);
+        if (ether_type == RTE_ETHER_TYPE_ARP) {
+          reply_to_arp_request(port_macs[port_id], ether_hdr, packets[i]);
+        } else if (ether_type == RTE_ETHER_TYPE_IPV4) {
+          reply_to_icmp_ping(ether_hdr, packets[i]);
+        } else {
+          printf("Received an unhandled packet with ethertype 0x%04x\n", ether_type);
+        }
+      }
+      /* send transformed packets back on the same port */
+      const auto nb_pkts_tx = rte_eth_tx_burst(port_id, 0, packets, nb_pkts_rx);
+      /* free any unsent packets */
       for (auto i = nb_pkts_tx; i < nb_pkts_rx; i++) {
         rte_pktmbuf_free(packets[i]);
       }
@@ -27,30 +63,27 @@ constexpr auto NUM_BUFS = 8191;
 }
 
 int main(int argc, char **argv) {
+  constexpr auto MBUF_CACHE_SIZE = 256;
+  constexpr auto NUM_BUFS = 8191;
+  constexpr auto NUM_DESCRIPTORS = 1024;
+  constexpr auto NUM_QUEUES = 1;
   uint16_t port_id;
-  struct rte_ether_addr addr;
-  rte_eth_conf port_conf {};
-  
+
+  rte_ether_addr port_macs[rte_eth_dev_count_avail()];
+  rte_eth_conf eth_conf {};
+
   rte_eal_init(argc, argv);
   rte_mempool *mbuf_pool = rte_pktmbuf_pool_create(
     "MBUF_POOL", NUM_BUFS, MBUF_CACHE_SIZE,
     0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-  
+
   RTE_ETH_FOREACH_DEV(port_id) {
-    rte_eth_dev_configure(port_id, 1, 1, &port_conf);
-    rte_eth_rx_queue_setup(port_id, 0, 1024, SOCKET_ID_ANY, NULL, mbuf_pool);
-	  rte_eth_macaddr_get(port_id, &addr);
-    RTE_LOG(INFO, EAL,
-        "Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
-                    " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
-        port_id,
-        addr.addr_bytes[0], addr.addr_bytes[1],
-        addr.addr_bytes[2], addr.addr_bytes[3],
-        addr.addr_bytes[4], addr.addr_bytes[5]);
-    rte_eth_tx_queue_setup(port_id, 0, 1024, SOCKET_ID_ANY, NULL);
+    rte_eth_dev_configure(port_id, NUM_QUEUES, NUM_QUEUES, &eth_conf);
+    rte_eth_rx_queue_setup(port_id, 0, NUM_DESCRIPTORS, SOCKET_ID_ANY, NULL, mbuf_pool);
+    rte_eth_macaddr_get(port_id, &port_macs[port_id]);
+    rte_eth_tx_queue_setup(port_id, 0, NUM_DESCRIPTORS, SOCKET_ID_ANY, NULL);
     rte_eth_dev_start(port_id);
-    rte_eth_promiscuous_enable(port_id);
   }
 
-  forward();
+  packet_processing_loop(port_macs);
 }
