@@ -1,6 +1,7 @@
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <utility>
+#include <vector>
 
 void reply_to_arp_request(
   const rte_ether_addr rx_port_mac_addr,
@@ -31,13 +32,16 @@ void reply_to_icmp_ping(
   icmp_hdr->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
 }
 
-[[noreturn]] static void packet_processing_loop(rte_ether_addr *port_macs) {
+[[noreturn]] static void packet_processing_loop(
+  std::vector<uint16_t> port_id_cache,
+  rte_ether_addr *port_macs)
+{
   uint16_t port_id;
   constexpr auto BURST_SIZE = 32;
   rte_mbuf *packets[BURST_SIZE];
 
   while(true) {
-    RTE_ETH_FOREACH_DEV(port_id) {
+    for (auto port_id : port_id_cache) {
       /* read burst of packets */
       const auto nb_pkts_rx = rte_eth_rx_burst(port_id, 0, packets, BURST_SIZE);
       for (auto i = 0; i < nb_pkts_rx; i++) {
@@ -68,6 +72,9 @@ int main(int argc, char **argv) {
   constexpr auto NUM_DESCRIPTORS = 1024;
   constexpr auto NUM_QUEUES = 1;
   uint16_t port_id;
+  /* Needed port caching to avoid scanning for ethernet drivers in the tight packet loop
+   * See flamegraphs in the perf folder */
+  std::vector<uint16_t> port_id_cache;
 
   rte_ether_addr port_macs[rte_eth_dev_count_avail()];
   rte_eth_conf eth_conf {};
@@ -78,6 +85,7 @@ int main(int argc, char **argv) {
     0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 
   RTE_ETH_FOREACH_DEV(port_id) {
+    port_id_cache.push_back(port_id);
     rte_eth_dev_configure(port_id, NUM_QUEUES, NUM_QUEUES, &eth_conf);
     rte_eth_rx_queue_setup(port_id, 0, NUM_DESCRIPTORS, SOCKET_ID_ANY, NULL, mbuf_pool);
     rte_eth_macaddr_get(port_id, &port_macs[port_id]);
@@ -85,5 +93,5 @@ int main(int argc, char **argv) {
     rte_eth_dev_start(port_id);
   }
 
-  packet_processing_loop(port_macs);
+  packet_processing_loop(port_id_cache, port_macs);
 }
